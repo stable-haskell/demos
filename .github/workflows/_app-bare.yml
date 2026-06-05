@@ -252,9 +252,15 @@ jobs:
           node-version: '22'
 
       - name: Install playwright + chromium
+        # node ESM resolves `import 'playwright'` by walking UP from the
+        # importing file's directory; smoke.mjs lives at
+        # $GITHUB_WORKSPACE/.github/scripts/, so the package must be in
+        # an ancestor's node_modules/. $GITHUB_WORKSPACE IS an ancestor;
+        # a sibling _pw/ directory is NOT. Install at the repo root.
+        # (package.json + node_modules are .gitignored.)
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/_pw" && cd "$GITHUB_WORKSPACE/_pw"
           npm init -y >/dev/null
           npm install --no-fund --no-audit playwright@1.49.1
           # `--with-deps` only takes effect on Linux (apt-get inside).
@@ -279,11 +285,8 @@ jobs:
             sleep 0.5
           done
           curl -fsSI "http://127.0.0.1:${PORT}/app.wasm" | head -1
-          # smoke.mjs lives in the checked-out repo; node resolves
-          # `playwright` from the _pw/node_modules we just populated.
-          ( cd "$GITHUB_WORKSPACE/_pw" && \
-            node "$GITHUB_WORKSPACE/.github/scripts/smoke.mjs" \
-                 "http://127.0.0.1:${PORT}/" "$SCREENSHOT_PATH" "$LOG_PATH" )
+          node "$GITHUB_WORKSPACE/.github/scripts/smoke.mjs" \
+               "http://127.0.0.1:${PORT}/" "$SCREENSHOT_PATH" "$LOG_PATH"
 
       # ---------------------------------------------------------------
       # 7. Publish per-platform screenshot to the `screenshots` branch.
