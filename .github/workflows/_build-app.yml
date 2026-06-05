@@ -41,10 +41,15 @@ jobs:
     name: build + smoke-test ${{ inputs.app_name }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # for pushing screenshots to the screenshots branch
       packages: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Need full credentials for the screenshots-branch push later.
+          # `persist-credentials: true` is checkout@v6's default but make
+          # it explicit so a future bump doesn't silently change it.
+          persist-credentials: true
 
       - name: Log in to ghcr
         uses: docker/login-action@v4
@@ -104,29 +109,92 @@ jobs:
                "$SCREENSHOT_PATH" "$LOG_PATH"
 
       # ---------------------------------------------------------------
-      # Inline the screenshot into the run summary. Uses a base64 data
-      # URI in the markdown so the image renders directly in the
-      # Actions UI — no artefact download required. PNGs run ~30-100KB
-      # here (b64-encoded ~40-140KB), well under the 1MB per-step
-      # GITHUB_STEP_SUMMARY limit.
-      # `if: always()` so a failing smoke test still surfaces its
-      # screenshot (often the most informative output).
+      # Publish the screenshot to an orphan `screenshots` branch so we
+      # have a stable HTTPS URL the run-summary markdown sanitiser will
+      # accept (it strips data: URIs, our first attempt — hence the
+      # branch hop).
+      #
+      # Layout on the branch:
+      #   <app>/latest.png      always overwritten with the latest run
+      #   <app>/<sha>.png       per-commit archive copy
+      #
+      # The branch is orphan and starts empty; per-app commits add or
+      # update files only. Concurrency: chess + solitaire run in
+      # parallel and both push to the same branch; we use git's atomic
+      # ref update + retry loop to handle the race.
       # ---------------------------------------------------------------
+      - name: Publish screenshot to `screenshots` branch
+        id: publish
+        if: ${{ always() && github.event_name != 'pull_request' }}
+        env:
+          SCREENSHOT_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-screenshot.png
+          APP: ${{ inputs.app_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "$SCREENSHOT_PATH" ]; then
+            echo "no_screenshot=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          short_sha=$(printf %.7s "$SHA")
+          wt=/tmp/screenshots-wt
+          # Fetch the screenshots branch if it exists; else create an
+          # orphan worktree to seed it.
+          if git ls-remote --exit-code --heads origin screenshots >/dev/null 2>&1; then
+            git fetch --depth 1 origin screenshots
+            git worktree add -B screenshots "$wt" origin/screenshots
+          else
+            git worktree add --detach "$wt" "$(git rev-parse HEAD)"
+            git -C "$wt" checkout --orphan screenshots
+            git -C "$wt" rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p "$wt/$APP"
+          cp "$SCREENSHOT_PATH" "$wt/$APP/latest.png"
+          cp "$SCREENSHOT_PATH" "$wt/$APP/${short_sha}.png"
+          git -C "$wt" config user.name  "github-actions[bot]"
+          git -C "$wt" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$wt" add "$APP/latest.png" "$APP/${short_sha}.png"
+          if git -C "$wt" diff --staged --quiet; then
+            echo "no changes to screenshots branch"
+          else
+            git -C "$wt" commit -m "screenshots: ${APP} @ ${short_sha}"
+          fi
+          # Push with retry-on-non-fast-forward (the parallel app jobs
+          # race for this same branch).
+          for i in 1 2 3 4 5; do
+            if git -C "$wt" push origin HEAD:screenshots; then
+              break
+            fi
+            echo "push race, attempt $i — rebasing"
+            git -C "$wt" fetch --depth 1 origin screenshots
+            git -C "$wt" rebase origin/screenshots
+          done
+          # raw.githubusercontent URLs for the run summary.
+          {
+            echo "screenshot_latest_url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/screenshots/${APP}/latest.png"
+            echo "screenshot_sha_url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/screenshots/${APP}/${short_sha}.png"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Embed screenshot in run summary
         if: always()
         env:
           SCREENSHOT_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-screenshot.png
           LOG_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-browser.log
+          IMG_URL: ${{ steps.publish.outputs.screenshot_sha_url }}
         run: |
           set -euo pipefail
           {
             echo "## ${{ inputs.app_name }} — smoke test result"
             echo
-            if [ -s "$SCREENSHOT_PATH" ]; then
+            if [ -n "$IMG_URL" ]; then
               size=$(wc -c <"$SCREENSHOT_PATH" | awk '{print $1}')
-              echo "Screenshot ($size bytes):"
+              echo "Screenshot (${size} bytes):"
               echo
-              echo "![${{ inputs.app_name }} screenshot](data:image/png;base64,$(base64 -w0 "$SCREENSHOT_PATH"))"
+              # raw.githubusercontent URL — GitHub's markdown sanitiser
+              # accepts these; data: URIs are stripped to broken <img>.
+              echo "![${{ inputs.app_name }} screenshot](${IMG_URL})"
+            elif [ -s "$SCREENSHOT_PATH" ]; then
+              echo "_(Screenshot captured but not published; available in the smoke artefact.)_"
             else
               echo "_No screenshot was produced (smoke test likely failed before navigation)._"
             fi

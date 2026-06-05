@@ -21,7 +21,7 @@ jobs:
   solitaire:
     name: solitaire
     permissions:
-      contents: read
+      contents: write   # passes through to _build-app.yml screenshots push
       packages: read
     uses: ./.github/workflows/_build-app.yml
     with:

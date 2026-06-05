@@ -161,7 +161,7 @@ jobs:
     needs: merge-image
     if: github.event_name != 'pull_request'
     permissions:
-      contents: read
+      contents: write   # passes through to _build-app.yml's screenshots-branch push
       packages: read
     uses: ./.github/workflows/_build-app.yml
     with:
@@ -173,7 +173,7 @@ jobs:
     needs: merge-image
     if: github.event_name != 'pull_request'
     permissions:
-      contents: read
+      contents: write   # passes through to _build-app.yml's screenshots-branch push
       packages: read
     uses: ./.github/workflows/_build-app.yml
     with:
