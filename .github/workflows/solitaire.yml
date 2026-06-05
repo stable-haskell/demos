@@ -6,12 +6,12 @@ name: solitaire — build & run
 # ---------------------------------------------------------------------
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_run:
+    workflows: ["Build & publish miso-wasm-demo image"]
+    types: [completed]
     branches: [main]
   schedule:
-    - cron: '30 7 * * 1'   # 30 min after chess.yml canary
+    - cron: '30 7 * * 1'
   workflow_dispatch:
     inputs:
       image_tag:
@@ -34,6 +34,7 @@ jobs:
   build-and-run:
     name: build + smoke-test solitaire
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: read

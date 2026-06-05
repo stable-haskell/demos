@@ -13,12 +13,17 @@ name: chess — build & run
 # ---------------------------------------------------------------------
 
 on:
-  push:
+  # Auto-trigger when the image-build workflow finishes successfully on
+  # main — this guarantees there's a fresh ghcr image to pull before
+  # we try to build chess against it.
+  workflow_run:
+    workflows: ["Build & publish miso-wasm-demo image"]
+    types: [completed]
     branches: [main]
-  pull_request:
-    branches: [main]
+  # Independent weekly canary so a broken image still surfaces on the
+  # PR dashboard even if the image build itself goes quiet.
   schedule:
-    - cron: '0 7 * * 1'   # weekly, one hour after image canary
+    - cron: '0 7 * * 1'
   workflow_dispatch:
     inputs:
       image_tag:
@@ -41,6 +46,9 @@ jobs:
   build-and-run:
     name: build + smoke-test chess
     runs-on: ubuntu-latest
+    # workflow_run fires on EVERY completion (success + failure); we
+    # only want to run if the build succeeded.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: read   # pull image from ghcr
