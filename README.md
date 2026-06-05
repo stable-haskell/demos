@@ -20,6 +20,16 @@ demos/
     └── solitaire.yml        builds + smoke-tests https://github.com/haskell-miso/solitaire
 ```
 
+The per-app workflows are chained off `build-image` via `workflow_run`,
+so a single push to `main` produces:
+
+```
+push -> build-image.yml -> success -> chess.yml + solitaire.yml (parallel)
+```
+
+PRs run only `build-image` (no push, no per-app), since the image isn't
+in ghcr until the merge lands.
+
 ## The image: `ghcr.io/stable-haskell/miso-wasm-demo`
 
 Published as a multi-arch manifest (`linux/amd64` + `linux/arm64`).
