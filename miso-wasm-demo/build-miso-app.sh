@@ -124,8 +124,9 @@ EOF
   # -p2 strips both `a/` and `static/` from the patch's left labels
   # since we apply against the staged-flat $out/index.js (the upstream
   # path is static/index.js, but we copied it directly to $out/).
-  patch -p2 -d "$out" --posix -i /home/builder/index.js.patch \
-        --backup-if-mismatch=no
+  # --posix forces strict POSIX behaviour (no fuzzy matching, no
+  # backups), which is what we want for a reproducible CI step.
+  patch -p2 -d "$out" --posix -i /home/builder/index.js.patch
 
   ok "[$name] built: $out/app.wasm ($(du -h "$out/app.wasm" | awk '{print $1}'))"
 }
