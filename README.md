@@ -16,18 +16,25 @@ demos/
 │   ├── index.js.patch       launcher patch (see "The index.js patch" below)
 │   └── Makefile             local dev wrapper (make image, make chess, ...)
 └── .github/workflows/
-    ├── apps.yml             orchestrator: full DAG in one run
-    ├── _build-app.yml       reusable per-app pipeline (workflow_call)
-    ├── chess.yml            thin workflow_dispatch + cron wrapper for chess
-    ├── solitaire.yml        thin workflow_dispatch + cron wrapper for solitaire
+    ├── apps.yml             container-path orchestrator: build image + run apps
+    ├── _build-app.yml       reusable container-path per-app pipeline
+    ├── chess.yml            thin workflow_dispatch + cron wrapper for chess (container)
+    ├── solitaire.yml        thin workflow_dispatch + cron wrapper for solitaire (container)
+    ├── bare.yml             bare-runner orchestrator: matrix (app × platform)
+    ├── _app-bare.yml        reusable bare-runner per-app pipeline (linux + macos)
     └── shellcheck.yml       lint every *.sh / shebang-shell file
 ```
 
-### Pipeline DAG
+### Two parallel CI paths
 
-`apps.yml` is the single source of truth. On every push to `main`
-(plus PRs, plus weekly cron, plus `workflow_dispatch`) the following
-DAG runs **in one workflow run**:
+The repo runs the same demo apps through **two independent CI paths**:
+
+| Path | Workflow | Triggered by | What it proves |
+|---|---|---|---|
+| **container** | `apps.yml` | push, PR, weekly cron, dispatch | The shipped `ghcr.io/.../miso-wasm-demo` image works end-to-end |
+| **bare runner** | `bare.yml`  | push (when relevant), weekly cron, dispatch | An end-user on a stock GitHub VM (linux x86_64, linux aarch64, macos arm64) can `ghcup install` the toolchain + drop in wasi-sdk + cabal build the app — no container, no nix |
+
+#### Container DAG (`apps.yml`)
 
 ```
        build-image (amd64) ─┐
@@ -35,16 +42,30 @@ DAG runs **in one workflow run**:
        build-image (arm64) ─┘                └─> solitaire
 ```
 
-`chess` and `solitaire` are `workflow_call`-style invocations of the
-reusable `_build-app.yml`, so adding a third demo app is **one new
-`needs: merge-image` block in `apps.yml`**, not a new ~80-line
-workflow. The thin `chess.yml` / `solitaire.yml` exist purely so that
-each app shows up as a top-level entry in the Actions sidebar — they
-delegate to the same reusable workflow and are useful for ad-hoc
-re-runs (`workflow_dispatch`) and per-app cron canaries.
+`chess` + `solitaire` here are `workflow_call`-style invocations of
+`_build-app.yml` (the reusable per-app pipeline), so adding a third
+demo app is one new `needs: merge-image` block, not a new ~80-line
+workflow. The thin `chess.yml` / `solitaire.yml` wrappers exist so
+each app gets a top-level Actions sidebar entry for ad-hoc re-runs
+(`workflow_dispatch`) and per-app cron canaries.
 
 PRs run only the image build (no push, no per-app), since the image
 isn't in ghcr until the merge lands.
+
+#### Bare-runner matrix (`bare.yml`)
+
+```
+chess     × { x86_64-linux | aarch64-linux | aarch64-darwin }
+solitaire × { x86_64-linux | aarch64-linux | aarch64-darwin }
+```
+
+Each entry is one `workflow_call` invocation of `_app-bare.yml` which
+does the literal end-user sequence: `apt`/`brew` deps → Node 22 →
+ghcup bootstrap → add stable-haskell channels → `ghcup install ghc
+multi-...` + `cabal-...` → direct `wasi-sdk` + `libffi-wasm` download
+→ `git clone haskell-miso/<app>` → drop dual-compiler cabal.project.local
+→ `cabal build` → apply `miso-wasm-demo/index.js.patch` → smoke-test in
+headless chromium. Same patch + same smoke script as the container path.
 
 ## The image: `ghcr.io/stable-haskell/miso-wasm-demo`
 

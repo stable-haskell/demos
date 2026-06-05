@@ -137,6 +137,7 @@ jobs:
             exit 0
           fi
           short_sha=$(printf %.7s "$SHA")
+          subdir="$APP/container"   # mirror of _app-bare.yml's "<app>/bare-<plat>"
           wt=/tmp/screenshots-wt
           # Fetch the screenshots branch if it exists; else create an
           # orphan worktree to seed it.
@@ -148,16 +149,16 @@ jobs:
             git -C "$wt" checkout --orphan screenshots
             git -C "$wt" rm -rf . >/dev/null 2>&1 || true
           fi
-          mkdir -p "$wt/$APP"
-          cp "$SCREENSHOT_PATH" "$wt/$APP/latest.png"
-          cp "$SCREENSHOT_PATH" "$wt/$APP/${short_sha}.png"
+          mkdir -p "$wt/$subdir"
+          cp "$SCREENSHOT_PATH" "$wt/$subdir/latest.png"
+          cp "$SCREENSHOT_PATH" "$wt/$subdir/${short_sha}.png"
           git -C "$wt" config user.name  "github-actions[bot]"
           git -C "$wt" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C "$wt" add "$APP/latest.png" "$APP/${short_sha}.png"
+          git -C "$wt" add "$subdir/latest.png" "$subdir/${short_sha}.png"
           if git -C "$wt" diff --staged --quiet; then
             echo "no changes to screenshots branch"
           else
-            git -C "$wt" commit -m "screenshots: ${APP} @ ${short_sha}"
+            git -C "$wt" commit -m "screenshots: ${APP} (container) @ ${short_sha}"
           fi
           # Push with retry-on-non-fast-forward (the parallel app jobs
           # race for this same branch).
@@ -171,8 +172,8 @@ jobs:
           done
           # raw.githubusercontent URLs for the run summary.
           {
-            echo "screenshot_latest_url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/screenshots/${APP}/latest.png"
-            echo "screenshot_sha_url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/screenshots/${APP}/${short_sha}.png"
+            echo "screenshot_latest_url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/screenshots/${subdir}/latest.png"
+            echo "screenshot_sha_url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/screenshots/${subdir}/${short_sha}.png"
           } >> "$GITHUB_OUTPUT"
 
       - name: Embed screenshot in run summary

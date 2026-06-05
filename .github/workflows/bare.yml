@@ -1,0 +1,57 @@
+name: Bare runners
+
+# Orchestrator for the bare-runner matrix — proves the
+# stable-haskell toolchain is end-user installable on stock
+# github-hosted runners (linux x86_64, linux aarch64, macos arm64).
+#
+# Complements apps.yml (container-based). Each entry calls
+# _app-bare.yml with the (app, platform, runner) triple.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Run only when something that affects the bare flow changes —
+      # otherwise skip (per-app smoke is already validated by apps.yml).
+      - 'miso-wasm-demo/index.js.patch'
+      - '.github/workflows/_app-bare.yml'
+      - '.github/workflows/bare.yml'
+      - '.github/scripts/smoke.mjs'
+  schedule:
+    # Weekly canary — same cadence as apps.yml, an hour later.
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      ghc_version:
+        required: false
+        type: string
+      cabal_version:
+        required: false
+        type: string
+
+concurrency:
+  group: bare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bare:
+    name: ${{ matrix.app }} / ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { app: chess,     platform: x86_64-linux,    runner: ubuntu-latest    }
+          - { app: chess,     platform: aarch64-linux,   runner: ubuntu-24.04-arm }
+          - { app: chess,     platform: aarch64-darwin,  runner: macos-15         }
+          - { app: solitaire, platform: x86_64-linux,    runner: ubuntu-latest    }
+          - { app: solitaire, platform: aarch64-linux,   runner: ubuntu-24.04-arm }
+          - { app: solitaire, platform: aarch64-darwin,  runner: macos-15         }
+    permissions:
+      contents: write   # passes through to _app-bare.yml screenshots push
+    uses: ./.github/workflows/_app-bare.yml
+    with:
+      app_name:      ${{ matrix.app }}
+      platform:      ${{ matrix.platform }}
+      runner:        ${{ matrix.runner }}
+      ghc_version:   ${{ inputs.ghc_version || 'multi-9.14.0.stable.1' }}
+      cabal_version: ${{ inputs.cabal_version || '3.17.0.0.stable.0' }}

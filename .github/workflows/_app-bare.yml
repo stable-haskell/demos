@@ -1,0 +1,370 @@
+name: _app-bare
+
+# Reusable per-app pipeline running on a BARE github-hosted runner —
+# no docker container, no pre-baked image. Proves that an end-user
+# starting from a stock ubuntu/macos VM can:
+#
+#   1. ghcup-install our multi-target GHC + stable-haskell cabal
+#   2. drop in wasi-sdk + libffi-wasm
+#   3. cabal build a TH-heavy miso app to wasm
+#   4. patch the upstream launcher
+#   5. open the result in headless chromium and watch miso render
+#
+# Each step is the literal sequence a human would run, so a regression
+# in any upstream piece (NodeSource, ghcup, the stable-haskell channels,
+# ghc-wasm-bindists, miso, …) surfaces here.
+#
+# Inputs:
+#   app_name   "chess" | "solitaire" | ...
+#   platform   "x86_64-linux" | "aarch64-linux" | "aarch64-darwin"
+#   runner     "ubuntu-latest" | "ubuntu-24.04-arm" | "macos-15"
+#   ghc_version, cabal_version, wasi_sdk_release, libffi_wasm_release
+#     override-able pins; defaults match miso-wasm-demo/Dockerfile.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'Demo app name (chess | solitaire | …)'
+        required: true
+        type: string
+      platform:
+        description: 'Target platform tag (x86_64-linux | aarch64-linux | aarch64-darwin)'
+        required: true
+        type: string
+      runner:
+        description: 'GitHub runner image label'
+        required: true
+        type: string
+      ghc_version:
+        required: false
+        type: string
+        default: multi-9.14.0.stable.1
+      cabal_version:
+        required: false
+        type: string
+        default: 3.17.0.0.stable.0
+      wasi_sdk_release:
+        required: false
+        type: string
+        default: 20251219T213239
+      libffi_wasm_release:
+        required: false
+        type: string
+        default: 20250310T060803
+
+env:
+  PORT: 8080
+
+jobs:
+  build-and-run:
+    name: ${{ inputs.app_name }} / bare / ${{ inputs.platform }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: write   # screenshots branch push
+    steps:
+      - uses: actions/checkout@v6
+
+      # ---------------------------------------------------------------
+      # 1. System deps (Linux). ghcup + Node 22 needs:
+      #    build-essential, curl, git, jq, unzip, patch, libgmp/ncurses
+      #    development headers (otherwise ghcup-installed ghc fails to
+      #    link against the system libs).
+      # ---------------------------------------------------------------
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              build-essential curl git ca-certificates xz-utils file \
+              jq unzip zstd patch \
+              libffi-dev libffi8 libgmp-dev libgmp10 \
+              libncurses-dev libtinfo6 zlib1g-dev libnuma-dev \
+              pkg-config
+
+      # ---------------------------------------------------------------
+      # 2. Node 22 — needed by post-link.mjs + the browser launcher
+      #    fetches import.meta.filename which lands in 20.11+.
+      # ---------------------------------------------------------------
+      - name: Install Node 22 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+          sudo apt-get install -y --no-install-recommends nodejs
+          # ubuntu-24.04-arm pre-bakes Node 20 in /opt/hostedtoolcache;
+          # force /usr/bin first so NodeSource's Node 22 wins PATH.
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          export PATH="/usr/bin:$PATH"
+          ver=$(node --version | tr -d v | cut -d. -f1)
+          test "$ver" -ge 22 || { echo "::error::expected Node 22+, got $(node --version)"; exit 1; }
+
+      - name: Install Node 22 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          NODE_VER=v22.22.0
+          NODE_DIR="$HOME/node-$NODE_VER"
+          rm -rf "$NODE_DIR"
+          curl -fsSL "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-arm64.tar.xz" | tar -xJ -C "$HOME"
+          mv "$HOME/node-$NODE_VER-darwin-arm64" "$NODE_DIR"
+          echo "$NODE_DIR/bin" >> "$GITHUB_PATH"
+          "$NODE_DIR/bin/node" --version
+
+      # ---------------------------------------------------------------
+      # 3. ghcup + stable-haskell channels.
+      # ---------------------------------------------------------------
+      - name: Install ghcup + add stable-haskell channels
+        env:
+          BOOTSTRAP_HASKELL_NONINTERACTIVE: '1'
+          BOOTSTRAP_HASKELL_MINIMAL: '1'
+          BOOTSTRAP_HASKELL_ADJUST_BASHRC: 'N'
+        run: |
+          set -euo pipefail
+          # Fresh per-run install — avoids picking up cached ghcup state
+          # from the runner image.
+          rm -rf "$HOME/.ghcup"
+          curl -fsSL https://get-ghcup.haskell.org | sh
+          echo "$HOME/.ghcup/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cabal/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.ghcup/bin:$HOME/.cabal/bin:$PATH"
+          ghcup --version
+          ghcup config add-release-channel https://stable-haskell.github.io/ghc/ghcup-multi-target-0.1.0.yaml
+          ghcup config add-release-channel https://stable-haskell.github.io/ghc/ghcup-wasm.yaml
+
+      - name: Install multi GHC + cabal
+        run: |
+          set -euo pipefail
+          ghcup install ghc   "${{ inputs.ghc_version }}"
+          ghcup set     ghc   "${{ inputs.ghc_version }}"
+          ghc --version
+          wasm32-unknown-wasi-ghc --version
+          ghcup install cabal "${{ inputs.cabal_version }}"
+          ghcup set     cabal "${{ inputs.cabal_version }}"
+          cabal --version
+          cabal update
+
+      # ---------------------------------------------------------------
+      # 4. wasi-sdk + libffi-wasm — direct downloads from
+      #    haskell-wasm/ghc-wasm-bindists; same pins as the Dockerfile.
+      #    We deliberately do NOT use ghc-wasm-meta's bootstrap.sh
+      #    because on aarch64-linux it falls into a "rebuild GHC 9.12
+      #    from source" path that's ~30 GB and orthogonal to what we
+      #    need (we already have a working wasm32 GHC).
+      # ---------------------------------------------------------------
+      - name: Install wasi-sdk + libffi-wasm
+        env:
+          WASI_SDK_RELEASE:   ${{ inputs.wasi_sdk_release }}
+          LIBFFI_WASM_RELEASE: ${{ inputs.libffi_wasm_release }}
+          PLATFORM:           ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          case "$PLATFORM" in
+            x86_64-linux)    TAR=wasi-sdk.tar.gz                ;;
+            aarch64-linux)   TAR=wasi-sdk-aarch64-linux.tar.gz  ;;
+            aarch64-darwin)  TAR=wasi-sdk-aarch64-darwin.tar.gz ;;
+            *) echo "::error::unknown platform: $PLATFORM"; exit 1 ;;
+          esac
+          mkdir -p "$HOME/.ghc-wasm/wasi-sdk"
+          curl -fL --retry 5 \
+            "https://github.com/haskell-wasm/ghc-wasm-bindists/releases/download/${WASI_SDK_RELEASE}/${TAR}" \
+            -o /tmp/wasi-sdk.tar.gz
+          tar xzf /tmp/wasi-sdk.tar.gz -C "$HOME/.ghc-wasm/wasi-sdk" --no-same-owner --strip-components=1
+          rm /tmp/wasi-sdk.tar.gz
+          curl -fL --retry 5 \
+            "https://github.com/haskell-wasm/ghc-wasm-bindists/releases/download/${LIBFFI_WASM_RELEASE}/libffi-wasm" \
+            -o /tmp/libffi-wasm.zip
+          unzip -q /tmp/libffi-wasm.zip -d /tmp/libffi-out
+          cp -a /tmp/libffi-out/out/libffi-wasm/include/. "$HOME/.ghc-wasm/wasi-sdk/share/wasi-sysroot/include/wasm32-wasi/"
+          cp -a /tmp/libffi-out/out/libffi-wasm/lib/.     "$HOME/.ghc-wasm/wasi-sdk/share/wasi-sysroot/lib/wasm32-wasi/"
+          rm -rf /tmp/libffi-wasm.zip /tmp/libffi-out
+          WB="$HOME/.ghc-wasm/wasi-sdk/bin"
+          # GHC searches for `wasm32-unknown-wasi-*`; wasi-sdk ships
+          # `wasm32-wasi-*` and `llvm-*`. Alias accordingly.
+          for t in clang clang++; do ln -sf "$WB/wasm32-wasi-$t" "$WB/wasm32-unknown-wasi-$t"; done
+          for t in ar nm ranlib strip; do ln -sf "$WB/llvm-$t" "$WB/wasm32-unknown-wasi-$t" 2>/dev/null || true; done
+          echo "$WB" >> "$GITHUB_PATH"
+          # macOS-only: keep Apple's /usr/bin/clang ahead of the wasm-
+          # only one we just prepended, otherwise GHC's native code-gen
+          # invokes wasi-sdk clang and fails with
+          #   unknown target triple 'arm64-apple-macosx15.0.0'
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "/usr/bin" >> "$GITHUB_PATH"
+          fi
+
+      # ---------------------------------------------------------------
+      # 5. Build the app.
+      # ---------------------------------------------------------------
+      - name: Clone + build ${{ inputs.app_name }}
+        env:
+          APP:   ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/$APP
+          git clone --depth 1 "https://github.com/haskell-miso/${APP}.git" "/tmp/$APP"
+          cd "/tmp/$APP"
+          cat > cabal.project.local <<'EOF'
+          with-build-compiler: ghc
+          with-compiler:       wasm32-unknown-wasi-ghc
+          with-hc-pkg:         wasm32-unknown-wasi-ghc-pkg
+          if arch(wasm32)
+            shared: True
+          package aeson
+            flags: -ordered-keymap
+          EOF
+          cabal build app 2>&1 | tail -n 60
+          wasm=$(find dist-newstyle -name 'app.wasm' -type f -print -quit)
+          test -n "$wasm" || { echo "::error::no app.wasm under dist-newstyle"; exit 1; }
+          libdir=$(wasm32-unknown-wasi-ghc --print-libdir)
+          mkdir -p out
+          node "$libdir/post-link.mjs" --input "$wasm" --output out/ghc_wasm_jsffi.js
+          [ -d static ] && cp -r static/. out/
+          cp "$wasm" out/app.wasm
+          # Patch the upstream launcher (same fix as the container image).
+          patch -p2 -d out --posix -i "$GITHUB_WORKSPACE/miso-wasm-demo/index.js.patch"
+          ls -lah out/
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.app_name }}-bare-${{ inputs.platform }}-bundle
+          path: /tmp/${{ inputs.app_name }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------------------------------------------------------------
+      # 6. Smoke-test: serve via python3 http.server + playwright.
+      # ---------------------------------------------------------------
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install playwright + chromium
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/_pw" && cd "$GITHUB_WORKSPACE/_pw"
+          npm init -y >/dev/null
+          npm install --no-fund --no-audit playwright@1.49.1
+          # `--with-deps` only takes effect on Linux (apt-get inside).
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            npx playwright install --with-deps chromium
+          else
+            npx playwright install chromium
+          fi
+
+      - name: Smoke-test in headless chromium
+        env:
+          APP_DIR: /tmp/${{ inputs.app_name }}/out
+          SCREENSHOT_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-bare-${{ inputs.platform }}-screenshot.png
+          LOG_PATH:        ${{ runner.temp }}/${{ inputs.app_name }}-bare-${{ inputs.platform }}-browser.log
+        run: |
+          set -euo pipefail
+          (cd "$APP_DIR" && python3 -m http.server "$PORT") >/tmp/httpd.log 2>&1 &
+          HTTPD_PID=$!
+          trap "kill $HTTPD_PID 2>/dev/null || true" EXIT
+          for i in $(seq 1 20); do
+            curl -fsS "http://127.0.0.1:${PORT}/index.html" >/dev/null && break
+            sleep 0.5
+          done
+          curl -fsSI "http://127.0.0.1:${PORT}/app.wasm" | head -1
+          # smoke.mjs lives in the checked-out repo; node resolves
+          # `playwright` from the _pw/node_modules we just populated.
+          ( cd "$GITHUB_WORKSPACE/_pw" && \
+            node "$GITHUB_WORKSPACE/.github/scripts/smoke.mjs" \
+                 "http://127.0.0.1:${PORT}/" "$SCREENSHOT_PATH" "$LOG_PATH" )
+
+      # ---------------------------------------------------------------
+      # 7. Publish per-platform screenshot to the `screenshots` branch.
+      #    Path: <app>/bare-<platform>/{latest,<short-sha>}.png
+      # ---------------------------------------------------------------
+      - name: Publish screenshot to `screenshots` branch
+        id: publish
+        if: ${{ always() && github.event_name != 'pull_request' }}
+        env:
+          SCREENSHOT_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-bare-${{ inputs.platform }}-screenshot.png
+          APP:      ${{ inputs.app_name }}
+          PLATFORM: ${{ inputs.platform }}
+          SHA:      ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "$SCREENSHOT_PATH" ]; then
+            echo "no_screenshot=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          short_sha=$(printf %.7s "$SHA")
+          wt=/tmp/screenshots-wt
+          if git ls-remote --exit-code --heads origin screenshots >/dev/null 2>&1; then
+            git fetch --depth 1 origin screenshots
+            git worktree add -B screenshots "$wt" origin/screenshots
+          else
+            git worktree add --detach "$wt" "$(git rev-parse HEAD)"
+            git -C "$wt" checkout --orphan screenshots
+            git -C "$wt" rm -rf . >/dev/null 2>&1 || true
+          fi
+          subdir="$APP/bare-$PLATFORM"
+          mkdir -p "$wt/$subdir"
+          cp "$SCREENSHOT_PATH" "$wt/$subdir/latest.png"
+          cp "$SCREENSHOT_PATH" "$wt/$subdir/${short_sha}.png"
+          git -C "$wt" config user.name  "github-actions[bot]"
+          git -C "$wt" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$wt" add "$subdir/latest.png" "$subdir/${short_sha}.png"
+          if git -C "$wt" diff --staged --quiet; then
+            echo "no changes"
+          else
+            git -C "$wt" commit -m "screenshots: ${APP} (bare-${PLATFORM}) @ ${short_sha}"
+          fi
+          # Atomic push with retry-on-non-fast-forward — many bare-runner
+          # jobs land on this branch concurrently.
+          for i in 1 2 3 4 5 6 7 8; do
+            if git -C "$wt" push origin HEAD:screenshots; then
+              break
+            fi
+            echo "push race, attempt $i — rebasing"
+            git -C "$wt" fetch --depth 1 origin screenshots
+            git -C "$wt" rebase origin/screenshots
+          done
+          echo "screenshot_sha_url=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/screenshots/${subdir}/${short_sha}.png" >> "$GITHUB_OUTPUT"
+
+      - name: Embed screenshot in run summary
+        if: always()
+        env:
+          SCREENSHOT_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-bare-${{ inputs.platform }}-screenshot.png
+          LOG_PATH:        ${{ runner.temp }}/${{ inputs.app_name }}-bare-${{ inputs.platform }}-browser.log
+          IMG_URL: ${{ steps.publish.outputs.screenshot_sha_url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## ${{ inputs.app_name }} — bare / ${{ inputs.platform }} smoke test"
+            echo
+            if [ -n "$IMG_URL" ]; then
+              size=$(wc -c <"$SCREENSHOT_PATH" | awk '{print $1}')
+              echo "Screenshot (${size} bytes):"
+              echo
+              echo "![${{ inputs.app_name }} bare-${{ inputs.platform }} screenshot](${IMG_URL})"
+            elif [ -s "$SCREENSHOT_PATH" ]; then
+              echo "_(Screenshot captured but not published; in the bundle artefact.)_"
+            else
+              echo "_No screenshot was produced (smoke test likely failed before navigation)._"
+            fi
+            echo
+            if [ -s "$LOG_PATH" ]; then
+              echo "<details><summary>Browser console + smoke.mjs log</summary>"
+              echo
+              echo '```'
+              tail -n 60 "$LOG_PATH"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload screenshot + browser log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.app_name }}-bare-${{ inputs.platform }}-smoke
+          path: |
+            ${{ runner.temp }}/${{ inputs.app_name }}-bare-${{ inputs.platform }}-screenshot.png
+            ${{ runner.temp }}/${{ inputs.app_name }}-bare-${{ inputs.platform }}-browser.log
+          if-no-files-found: warn
+          retention-days: 30
