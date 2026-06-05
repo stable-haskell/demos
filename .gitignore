@@ -1,0 +1,15 @@
+# Build artefacts produced by the per-app docker runs.
+out/
+
+# Local cabal/dist outputs if someone runs the build outside the container.
+dist-newstyle/
+
+# Playwright + npm artefacts from local smoke tests (CI installs into a
+# fresh workspace each run).
+node_modules/
+package.json
+package-lock.json
+
+# Editor / OS noise.
+.DS_Store
+*.swp

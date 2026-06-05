@@ -1,0 +1,167 @@
+name: Build & publish miso-wasm-demo image
+
+# ---------------------------------------------------------------------
+# Builds ghcr.io/stable-haskell/miso-wasm-demo for both linux/amd64 and
+# linux/arm64, then merges them into a single multi-arch manifest.
+#
+# Per-arch builds run on their native runners (no QEMU emulation):
+#   linux/amd64 -> ubuntu-latest
+#   linux/arm64 -> ubuntu-24.04-arm
+#
+# The merge job composes the two by-digest pushes into the user-facing
+# tags (:latest, :<short-sha>, :<branch>). This is the docker/build-push-
+# action recommended pattern, much faster than --platform on one runner.
+# ---------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'miso-wasm-demo/**'
+      - '.github/workflows/build-image.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'miso-wasm-demo/**'
+      - '.github/workflows/build-image.yml'
+  schedule:
+    # Weekly canary — catches drift in NodeSource setup_22.x, the
+    # stable-haskell channels, ghc-wasm-bindists releases, etc.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Only the most recent push per branch needs to publish.
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/miso-wasm-demo
+
+jobs:
+  # -------------------------------------------------------------------
+  # Per-arch native build → push by digest to ghcr.
+  # Each runner produces `ghcr.io/.../miso-wasm-demo@sha256:<digest>`
+  # and exports the digest so the manifest job can stitch them.
+  # -------------------------------------------------------------------
+  build:
+    name: build / ${{ matrix.platform-short }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            platform-short: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            platform-short: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr
+        # PRs from forks can't push — skip login + push in that case.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build & push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./miso-wasm-demo
+          file: ./miso-wasm-demo/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # On PRs we just build (no push, no by-digest). On main / cron
+          # / dispatch we push by digest so the merge job below can
+          # combine arches into one tag.
+          outputs: |
+            ${{ github.event_name == 'pull_request' && 'type=docker' || format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, env.IMAGE_NAME) }}
+          cache-from: type=gha,scope=miso-wasm-demo-${{ matrix.platform-short }}
+          cache-to:   type=gha,scope=miso-wasm-demo-${{ matrix.platform-short }},mode=max
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform-short }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # -------------------------------------------------------------------
+  # Combine per-arch digests into a single multi-arch manifest, tagged
+  # :latest, :<short-sha>, and :<branch-or-pr>.
+  # -------------------------------------------------------------------
+  merge:
+    name: merge multi-arch manifest
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (final tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,format=short
+
+      - name: Create manifest & push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect resulting image
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
