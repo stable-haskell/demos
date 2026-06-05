@@ -10,6 +10,9 @@ name: _build-app
 #   4. Serve out/<app>/ via python3 -m http.server and load it in
 #      headless chromium via playwright; assert miso mounted, no
 #      pageerrors, capture a screenshot.
+#   5. Inline the screenshot into the workflow run summary as a base64
+#      data URI so it renders directly on the Actions page — no need
+#      to download the smoke-test artefact to glance at the result.
 #
 # Inputs:
 #   app_name   Required. "chess" | "solitaire" | future demos.
@@ -41,10 +44,10 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Log in to ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -65,14 +68,14 @@ jobs:
           file  "out/${{ inputs.app_name }}/app.wasm"
 
       - name: Upload bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.app_name }}-bundle
           path: out/${{ inputs.app_name }}/
           if-no-files-found: error
           retention-days: 30
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '22'
 
@@ -100,9 +103,47 @@ jobs:
           node .github/scripts/smoke.mjs "http://127.0.0.1:${PORT}/" \
                "$SCREENSHOT_PATH" "$LOG_PATH"
 
+      # ---------------------------------------------------------------
+      # Inline the screenshot into the run summary. Uses a base64 data
+      # URI in the markdown so the image renders directly in the
+      # Actions UI — no artefact download required. PNGs run ~30-100KB
+      # here (b64-encoded ~40-140KB), well under the 1MB per-step
+      # GITHUB_STEP_SUMMARY limit.
+      # `if: always()` so a failing smoke test still surfaces its
+      # screenshot (often the most informative output).
+      # ---------------------------------------------------------------
+      - name: Embed screenshot in run summary
+        if: always()
+        env:
+          SCREENSHOT_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-screenshot.png
+          LOG_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-browser.log
+        run: |
+          set -euo pipefail
+          {
+            echo "## ${{ inputs.app_name }} — smoke test result"
+            echo
+            if [ -s "$SCREENSHOT_PATH" ]; then
+              size=$(wc -c <"$SCREENSHOT_PATH" | awk '{print $1}')
+              echo "Screenshot ($size bytes):"
+              echo
+              echo "![${{ inputs.app_name }} screenshot](data:image/png;base64,$(base64 -w0 "$SCREENSHOT_PATH"))"
+            else
+              echo "_No screenshot was produced (smoke test likely failed before navigation)._"
+            fi
+            echo
+            if [ -s "$LOG_PATH" ]; then
+              echo "<details><summary>Browser console + smoke.mjs log</summary>"
+              echo
+              echo '```'
+              tail -n 60 "$LOG_PATH"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload screenshot + browser log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.app_name }}-smoke
           path: |
