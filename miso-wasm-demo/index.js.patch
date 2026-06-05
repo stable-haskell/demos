@@ -1,0 +1,40 @@
+Patch: miso 1.11 / GHC 9.14 RTS bring-up contract for the upstream
+haskell-miso/{chess,solitaire}.git launcher.
+
+The upstream static/index.js predates miso 1.11 / GHC 9.14 and is
+missing two pieces the current RTS requires:
+
+  1. @bjorn3/browser_wasi_shim must be >= 0.4.2 — the WASI import set
+     changed between 0.3.0 and 0.4.x; on 0.3.0 our wasm module fails
+     to instantiate against this shim.
+
+  2. instance.exports.__ghc_wasm_jsffi_init() MUST be invoked between
+     wasi.initialize(instance) and the first hs_start() call. Without
+     it the RTS panics:
+        [WASI stderr] newBoundTask: RTS is not initialised;
+                      call hs_init() first
+     and the wasm module exits before miso ever mounts to <body>.
+
+The chess + solitaire repos ship the identical static/index.js, so a
+single patch fits both. Once they update their launcher upstream this
+file can be retired.
+
+(GNU patch ignores everything above the first `--- a/...` header, so
+this preamble passes straight through.)
+
+--- a/static/index.js
++++ b/static/index.js
+@@ -1,5 +1,5 @@
+ 
+-import { WASI, OpenFile, File, ConsoleStdout } from "https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.3.0/dist/index.js";
++import { WASI, OpenFile, File, ConsoleStdout } from "https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.4.2/dist/index.js";
+ import ghc_wasm_jsffi from "./ghc_wasm_jsffi.js";
+ 
+ const args = [];
+@@ -20,5 +20,6 @@
+ Object.assign(instance_exports, instance.exports);
+ 
+ wasi.initialize(instance);
++instance.exports.__ghc_wasm_jsffi_init();
+ await instance.exports.hs_start(globalThis.example);
+ 

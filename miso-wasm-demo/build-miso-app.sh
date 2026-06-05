@@ -114,50 +114,18 @@ EOF
   cp "$wasm" "$out/app.wasm"
 
   # ---------------------------------------------------------------------
-  # Patch the upstream index.js — chess + solitaire ship a launcher that
-  # predates miso 1.11 / GHC 9.14's RTS init contract. Two missing bits:
-  #   * browser_wasi_shim must be 0.4.2+ (WASI imports drifted).
-  #   * __ghc_wasm_jsffi_init() must be called between wasi.initialize()
-  #     and hs_start(), else the RTS throws
-  #     "RTS is not initialised; call hs_init() first".
-  # The phase6-miso-template launcher gets it right; we rewrite the
-  # repo's index.js to that pattern. globalThis.example is preserved
-  # as the hs_start argument so apps that wire entry-point data through
-  # window.example keep working.
+  # Patch the staged index.js. The upstream chess + solitaire launchers
+  # predate miso 1.11 / GHC 9.14's RTS init contract and ship an old
+  # browser_wasi_shim. See ../index.js.patch's header for the rationale;
+  # it's a two-hunk minimal-edit unified diff that GNU patch applies in
+  # under a millisecond.
   # ---------------------------------------------------------------------
-  log "[$name] rewriting index.js with __ghc_wasm_jsffi_init() shim"
-  cat > "$out/index.js" <<'EOF'
-import {
-  WASI,
-  OpenFile,
-  File,
-  ConsoleStdout,
-} from "https://esm.sh/@bjorn3/browser_wasi_shim@0.4.2";
-import ghc_wasm_jsffi from "./ghc_wasm_jsffi.js";
-
-const args = [];
-const env  = ["GHCRTS=-H64m"];
-const fds  = [
-  new OpenFile(new File([])),
-  ConsoleStdout.lineBuffered((m) => console.log (`[hs stdout] ${m}`)),
-  ConsoleStdout.lineBuffered((m) => console.warn(`[hs stderr] ${m}`)),
-];
-const wasi = new WASI(args, env, fds, { debug: false });
-
-const instance_exports = {};
-const { instance } = await WebAssembly.instantiateStreaming(fetch("./app.wasm"), {
-  wasi_snapshot_preview1: wasi.wasiImport,
-  ghc_wasm_jsffi:         ghc_wasm_jsffi(instance_exports),
-});
-Object.assign(instance_exports, instance.exports);
-
-// Reactor bring-up: see GHC user's guide §15. The __ghc_wasm_jsffi_init()
-// call between wasi.initialize() and hs_start() is REQUIRED on GHC 9.14;
-// without it hs_start panics with "RTS is not initialised".
-wasi.initialize(instance);
-instance.exports.__ghc_wasm_jsffi_init();
-await instance.exports.hs_start(globalThis.example);
-EOF
+  log "[$name] applying index.js.patch (browser_wasi_shim 0.4.2 + jsffi init)"
+  # -p2 strips both `a/` and `static/` from the patch's left labels
+  # since we apply against the staged-flat $out/index.js (the upstream
+  # path is static/index.js, but we copied it directly to $out/).
+  patch -p2 -d "$out" --posix -i /home/builder/index.js.patch \
+        --backup-if-mismatch=no
 
   ok "[$name] built: $out/app.wasm ($(du -h "$out/app.wasm" | awk '{print $1}'))"
 }

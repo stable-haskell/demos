@@ -45,7 +45,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential curl git ca-certificates xz-utils file sudo \
-      jq unzip zstd \
+      jq unzip zstd patch \
       libffi-dev libffi8 libgmp-dev libgmp10 \
       libncurses-dev libtinfo6 zlib1g-dev libnuma-dev \
       pkg-config \
@@ -166,6 +166,7 @@ RUN cabal update
 # the host to extract build artefacts.
 # ---------------------------------------------------------------------
 COPY --chown=builder:builder build-miso-app.sh /home/builder/build-miso-app.sh
+COPY --chown=builder:builder index.js.patch    /home/builder/index.js.patch
 RUN chmod +x /home/builder/build-miso-app.sh \
  && mkdir -p /home/builder/work /home/builder/out
 
