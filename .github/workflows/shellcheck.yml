@@ -1,0 +1,48 @@
+name: shellcheck
+
+# Lints every committed *.sh in the repo with shellcheck. Fast (~10s)
+# enough to run on every push + PR without a paths filter.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: shellcheck-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find shell scripts
+        id: find
+        run: |
+          # Match by extension (.sh) AND by shebang (#!/usr/bin/env bash
+          # etc.) so we cover anything executable that's actually a
+          # shell script — Makefiles + .yml are intentionally out of
+          # scope (different linters).
+          mapfile -t files < <(git ls-files -z | xargs -0 -r grep -l '^#![[:space:]]*\(/usr/bin/env[[:space:]]\)\?\(ba\)\?sh' 2>/dev/null || true)
+          # Also pick up anything ending in .sh that the heuristic missed.
+          while IFS= read -r f; do files+=("$f"); done < <(git ls-files '*.sh' '**/*.sh')
+          # Deduplicate.
+          printf '%s\n' "${files[@]}" | sort -u > /tmp/sh-files
+          cat /tmp/sh-files
+          echo "count=$(wc -l < /tmp/sh-files)" >> "$GITHUB_OUTPUT"
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Run shellcheck
+        run: |
+          set -euo pipefail
+          xargs -a /tmp/sh-files -r shellcheck --shell=bash --color=always
+          echo "::notice::shellcheck clean across ${{ steps.find.outputs.count }} scripts"
