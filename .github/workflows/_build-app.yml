@@ -1,0 +1,112 @@
+name: _build-app
+
+# Reusable per-app build pipeline. Called by apps.yml (and optionally by
+# the thin chess.yml / solitaire.yml wrappers for ad-hoc re-runs).
+#
+# What it does, given an app name:
+#   1. Pull ghcr.io/<owner>/miso-wasm-demo:<image_tag>.
+#   2. Run the container to build that app to wasm.
+#   3. Upload the built bundle as a workflow artefact.
+#   4. Serve out/<app>/ via python3 -m http.server and load it in
+#      headless chromium via playwright; assert miso mounted, no
+#      pageerrors, capture a screenshot.
+#
+# Inputs:
+#   app_name   Required. "chess" | "solitaire" | future demos.
+#   image_tag  Optional. Defaults to "latest".
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'Name of the demo app inside the container (chess | solitaire | …)'
+        required: true
+        type: string
+      image_tag:
+        description: 'Tag of ghcr.io/<owner>/miso-wasm-demo to pull (default: latest)'
+        required: false
+        type: string
+        default: latest
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/miso-wasm-demo
+  PORT: 8080
+
+jobs:
+  build-and-run:
+    name: build + smoke-test ${{ inputs.app_name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull miso-wasm-demo image
+        run: |
+          docker pull "${REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}"
+
+      - name: Build ${{ inputs.app_name }}
+        run: |
+          mkdir -p out
+          docker run --rm \
+            -v "$PWD/out:/home/builder/out" \
+            "${REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}" \
+            "${{ inputs.app_name }}"
+          ls -lah "out/${{ inputs.app_name }}/"
+          file  "out/${{ inputs.app_name }}/app.wasm"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-bundle
+          path: out/${{ inputs.app_name }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install playwright + chromium
+        run: |
+          npm init -y >/dev/null
+          npm install --no-fund --no-audit playwright@1.49.1
+          npx playwright install --with-deps chromium
+
+      - name: Smoke-test in headless chromium
+        env:
+          APP_DIR: out/${{ inputs.app_name }}
+          SCREENSHOT_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-screenshot.png
+          LOG_PATH: ${{ runner.temp }}/${{ inputs.app_name }}-browser.log
+        run: |
+          set -euo pipefail
+          (cd "$APP_DIR" && python3 -m http.server "$PORT") >/tmp/httpd.log 2>&1 &
+          HTTPD_PID=$!
+          trap "kill $HTTPD_PID 2>/dev/null || true" EXIT
+          for i in $(seq 1 20); do
+            curl -fsS "http://127.0.0.1:${PORT}/index.html" >/dev/null && break
+            sleep 0.5
+          done
+          curl -fsSI "http://127.0.0.1:${PORT}/app.wasm" | head -1
+          node .github/scripts/smoke.mjs "http://127.0.0.1:${PORT}/" \
+               "$SCREENSHOT_PATH" "$LOG_PATH"
+
+      - name: Upload screenshot + browser log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-smoke
+          path: |
+            ${{ runner.temp }}/${{ inputs.app_name }}-screenshot.png
+            ${{ runner.temp }}/${{ inputs.app_name }}-browser.log
+          if-no-files-found: warn
+          retention-days: 30

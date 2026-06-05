@@ -1,38 +1,36 @@
-name: Build & publish miso-wasm-demo image
+name: Apps DAG
 
-# ---------------------------------------------------------------------
-# Builds ghcr.io/stable-haskell/miso-wasm-demo for both linux/amd64 and
-# linux/arm64, then merges them into a single multi-arch manifest.
+# Single source of truth for the pipeline.
 #
-# Per-arch builds run on their native runners (no QEMU emulation):
-#   linux/amd64 -> ubuntu-latest
-#   linux/arm64 -> ubuntu-24.04-arm
+# DAG (all four jobs live in ONE run, no workflow_run choreography):
 #
-# The merge job composes the two by-digest pushes into the user-facing
-# tags (:latest, :<short-sha>, :<branch>). This is the docker/build-push-
-# action recommended pattern, much faster than --platform on one runner.
-# ---------------------------------------------------------------------
+#       build-image (amd64) ─┐
+#                            ├─> merge-image ─┬─> chess
+#       build-image (arm64) ─┘                └─> solitaire
+#
+# Triggers:
+#   * push to main on miso-wasm-demo/** or workflow files
+#   * pull request (image build only, no push; per-app jobs still run
+#     against the freshly-built local image — see _build-app.yml note)
+#   * weekly Monday cron canary (catches drift in NodeSource, the
+#     stable-haskell channels, ghc-wasm-bindists, etc.)
+#   * workflow_dispatch
+#
+# The per-app jobs call ./.github/workflows/_build-app.yml (reusable);
+# adding a third demo app is one new `needs: merge-image` block, not a
+# new ~80-line workflow.
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'miso-wasm-demo/**'
-      - '.github/workflows/build-image.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'miso-wasm-demo/**'
-      - '.github/workflows/build-image.yml'
   schedule:
-    # Weekly canary — catches drift in NodeSource setup_22.x, the
-    # stable-haskell channels, ghc-wasm-bindists releases, etc.
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
-# Only the most recent push per branch needs to publish.
 concurrency:
-  group: build-image-${{ github.ref }}
+  group: apps-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -41,12 +39,10 @@ env:
 
 jobs:
   # -------------------------------------------------------------------
-  # Per-arch native build → push by digest to ghcr.
-  # Each runner produces `ghcr.io/.../miso-wasm-demo@sha256:<digest>`
-  # and exports the digest so the manifest job can stitch them.
+  # Per-arch native build, push by digest. PRs build without pushing.
   # -------------------------------------------------------------------
-  build:
-    name: build / ${{ matrix.platform-short }}
+  build-image:
+    name: build-image / ${{ matrix.platform-short }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -63,12 +59,9 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr
-        # PRs from forks can't push — skip login + push in that case.
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
@@ -76,23 +69,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata
-        id: meta
+      - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
-      - name: Build & push by digest
-        id: build
+      - id: build
         uses: docker/build-push-action@v6
         with:
           context: ./miso-wasm-demo
           file: ./miso-wasm-demo/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          # On PRs we just build (no push, no by-digest). On main / cron
-          # / dispatch we push by digest so the merge job below can
-          # combine arches into one tag.
           outputs: |
             ${{ github.event_name == 'pull_request' && 'type=docker' || format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, env.IMAGE_NAME) }}
           cache-from: type=gha,scope=miso-wasm-demo-${{ matrix.platform-short }}
@@ -115,37 +103,35 @@ jobs:
           retention-days: 1
 
   # -------------------------------------------------------------------
-  # Combine per-arch digests into a single multi-arch manifest, tagged
-  # :latest, :<short-sha>, and :<branch-or-pr>.
+  # Combine per-arch digests into a multi-arch manifest (:latest, :sha,
+  # :branch). Skipped on PRs (no push).
   # -------------------------------------------------------------------
-  merge:
+  merge-image:
     name: merge multi-arch manifest
-    needs: build
+    needs: build-image
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.version }}
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
           pattern: digests-*
           merge-multiple: true
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to ghcr
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata (final tags)
-        id: meta
+      - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -165,3 +151,31 @@ jobs:
         run: |
           docker buildx imagetools inspect \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+  # -------------------------------------------------------------------
+  # Per-app build + smoke-test. Each is a single line here — the actual
+  # job body lives in _build-app.yml so adding a new demo is trivial.
+  # -------------------------------------------------------------------
+  chess:
+    name: chess
+    needs: merge-image
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/_build-app.yml
+    with:
+      app_name: chess
+      image_tag: latest
+
+  solitaire:
+    name: solitaire
+    needs: merge-image
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/_build-app.yml
+    with:
+      app_name: solitaire
+      image_tag: latest

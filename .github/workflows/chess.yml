@@ -1,135 +1,33 @@
-name: chess — build & run
+name: chess
 
-# ---------------------------------------------------------------------
-# 1. Pull the latest miso-wasm-demo image from ghcr.
-# 2. Build haskell-miso/chess.git to wasm inside that container.
-# 3. Headless-browser smoke test:
-#      python3 -m http.server   serves the built static/ + app.wasm
-#      playwright headless chromium  loads the page, exits if any
-#                                    pageerror surfaces, asserts that
-#                                    miso has mounted DOM into <body>
-#      screenshot captured for visual verification.
-# 4. Upload BOTH the built bundle and the screenshot as artefacts.
-# ---------------------------------------------------------------------
+# Thin wrapper around _build-app.yml so the chess pipeline appears as a
+# top-level workflow in the Actions sidebar — useful for ad-hoc re-runs
+# of just chess (workflow_dispatch) and for the weekly chess-only
+# canary (cron). The full DAG (image build -> chess + solitaire) lives
+# in apps.yml.
 
 on:
-  # Auto-trigger when the image-build workflow finishes successfully on
-  # main — this guarantees there's a fresh ghcr image to pull before
-  # we try to build chess against it.
-  workflow_run:
-    workflows: ["Build & publish miso-wasm-demo image"]
-    types: [completed]
-    branches: [main]
-  # Independent weekly canary so a broken image still surfaces on the
-  # PR dashboard even if the image build itself goes quiet.
-  schedule:
-    - cron: '0 7 * * 1'
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag to use (default: latest)'
+        description: 'Image tag to pull (default: latest)'
         required: false
+        type: string
         default: latest
+  schedule:
+    - cron: '0 7 * * 1'   # Monday 07:00 UTC — independent canary
 
 concurrency:
   group: chess-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/miso-wasm-demo
-  IMAGE_TAG:  ${{ inputs.image_tag || 'latest' }}
-  APP_NAME:   chess
-  PORT:       8080
-
 jobs:
-  build-and-run:
-    name: build + smoke-test chess
-    runs-on: ubuntu-latest
-    # workflow_run fires on EVERY completion (success + failure); we
-    # only want to run if the build succeeded.
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+  chess:
+    name: chess
     permissions:
       contents: read
-      packages: read   # pull image from ghcr
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Log in to ghcr
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull miso-wasm-demo image
-        run: |
-          docker pull "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
-
-      # -----------------------------------------------------------------
-      # The container writes into /home/builder/out/<app>/ — bind-mount
-      # the runner's $PWD/out so artefacts land where the rest of the
-      # workflow can see them.
-      # -----------------------------------------------------------------
-      - name: Build chess
-        run: |
-          mkdir -p out
-          docker run --rm \
-            -v "$PWD/out:/home/builder/out" \
-            "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" \
-            "${APP_NAME}"
-          ls -lah "out/${APP_NAME}/"
-          file  "out/${APP_NAME}/app.wasm"
-
-      - name: Upload chess bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: chess-bundle
-          path: out/${{ env.APP_NAME }}/
-          if-no-files-found: error
-          retention-days: 30
-
-      # -----------------------------------------------------------------
-      # Smoke-test: load the page in headless chromium and verify miso
-      # actually mounted into the DOM. Captures a screenshot either way.
-      # -----------------------------------------------------------------
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install playwright + chromium
-        run: |
-          npm init -y >/dev/null
-          npm install --no-fund --no-audit playwright@1.49.1
-          npx playwright install --with-deps chromium
-
-      - name: Smoke-test in headless chromium
-        env:
-          APP_DIR: out/${{ env.APP_NAME }}
-          SCREENSHOT_PATH: ${{ runner.temp }}/chess-screenshot.png
-          LOG_PATH: ${{ runner.temp }}/chess-browser.log
-        run: |
-          set -euo pipefail
-          # Start http-server in background, wait for it to listen.
-          (cd "$APP_DIR" && python3 -m http.server "$PORT") >/tmp/httpd.log 2>&1 &
-          HTTPD_PID=$!
-          trap "kill $HTTPD_PID 2>/dev/null || true" EXIT
-          for i in $(seq 1 20); do
-            curl -fsS "http://127.0.0.1:${PORT}/index.html" >/dev/null && break
-            sleep 0.5
-          done
-          curl -fsSI "http://127.0.0.1:${PORT}/app.wasm" | head -1
-          # Run the smoke test (path is committed at .github/scripts/smoke.mjs).
-          node .github/scripts/smoke.mjs "http://127.0.0.1:${PORT}/" \
-               "$SCREENSHOT_PATH" "$LOG_PATH"
-
-      - name: Upload screenshot + browser log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: chess-smoke
-          path: |
-            ${{ runner.temp }}/chess-screenshot.png
-            ${{ runner.temp }}/chess-browser.log
-          if-no-files-found: warn
-          retention-days: 30
+      packages: read
+    uses: ./.github/workflows/_build-app.yml
+    with:
+      app_name: chess
+      image_tag: ${{ inputs.image_tag || 'latest' }}
