@@ -123,8 +123,18 @@ jobs:
           BOOTSTRAP_HASKELL_ADJUST_BASHRC: 'N'
         run: |
           set -euo pipefail
-          # Fresh per-run install — avoids picking up cached ghcup state
-          # from the runner image.
+          # GitHub-hosted runners (ubuntu-latest, ubuntu-24.04-arm,
+          # macos-15) pre-install ghcup at /usr/local/.ghcup and set
+          # GHCUP_INSTALL_BASE_PREFIX=/usr/local in the runner env.
+          # Our `curl | sh` would honor that and try to chmod files
+          # under /usr/local as a non-root user — Operation not
+          # permitted. Override to $HOME so everything (the bootstrap
+          # AND every subsequent `ghcup install`) lands in
+          # $HOME/.ghcup, which we own.
+          export GHCUP_INSTALL_BASE_PREFIX="$HOME"
+          # Persist for every later step too.
+          echo "GHCUP_INSTALL_BASE_PREFIX=$HOME" >> "$GITHUB_ENV"
+          # Fresh per-run install — avoid picking up any cached state.
           rm -rf "$HOME/.ghcup"
           curl -fsSL https://get-ghcup.haskell.org | sh
           echo "$HOME/.ghcup/bin" >> "$GITHUB_PATH"
